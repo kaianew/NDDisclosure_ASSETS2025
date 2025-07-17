@@ -1,0 +1,722 @@
+---
+title: "Main Analysis for ADHD Programmers Mental Health/Disclosure"
+output: html_notebook
+author: "A1"
+date: "2024-08-13"
+---
+
+# Load data
+
+```{r}
+source("standard_cleaning.R")
+library(lme4)
+nrow(data)
+
+# Drop Q73_5 -- it was not answered by anyone
+data = subset(data, select = -Q73_5)
+
+# Make task competency be numeric
+data[116:122] = lapply(data[116:122], function(x) as.numeric(x))
+
+# Function to convert model summary to a LaTeX table
+make_xtable = function(model) {
+  xtable_model <- xtable(summary(model))
+  return(xtable_model)
+}
+
+data$stigma = as.numeric(data$stigma)
+```
+
+# Reconfigure groups, add meta-level info columns
+
+```{r}
+# Now want five levels of group: ADHD, AuDHD, Autism, Other ND, NT
+# ifelse(test, yes, no) --> can be nested
+# Q3_4 is Autism
+data$group = ifelse(data$HasADHD, ifelse(is.na(data$Q3_4), "ADHD", "AuDHD"), ifelse(data$OtherND, ifelse(is.na(data$Q3_4), "Other ND", "Autistic"), "NT"))
+data$group = factor(data$group)
+
+tmp = subset(data, group == "Other ND")
+# nrow(tmp) 
+# 16 people are neurodivergent but not ADHD or autistic
+# Referred back to the data to validate categorization: looks good.
+
+# Make table for num. neurotypes
+num_neurotypes = as.data.frame(table(data$group))
+num_neurotypes$Percent = paste0(round((num_neurotypes$Freq / 493) * 100), "%")
+# Swap rows 1 and 3
+num_neurotypes[c(4, 5), ] = num_neurotypes[c(5, 4), ]
+num_neurotypes = xtable(num_neurotypes)
+print(num_neurotypes, include.rownames = FALSE, file = "num_neurotypes.tex")
+
+# Add column for ND people saying whether or not they disclosed
+data$disclosed = ifelse(!is.na(data[193]) , FALSE, ifelse((!is.na(data[194]) | !is.na(data[195]) | !is.na(data[196])), TRUE, FALSE))
+
+# Add column saying whether the person had any self-disclosed mental health conditions.
+data$mh_condition = ifelse(is.na(data$Q17), FALSE, TRUE)
+data$mh_condition = factor(data$mh_condition)
+
+# Add column saying whether the person was granted any accommodations
+data$has_acc = ifelse(is.na(data$acc.grant._1), FALSE, TRUE)
+data$has_acc = factor(data$has_acc)
+```
+
+# Change levels of group so we're comparing to NT people
+
+```{r}
+levels(data$group)
+
+data$group = relevel(data$group, ref = "NT")
+levels(data$group)
+
+# See how many people did not answer all of the questions necessary to avg PMH
+tmp = subset(data, is.na(pmh_avg))
+nrow(tmp)
+tmp = subset(data, is.na(country))
+nrow(tmp)
+
+# find table of people in large/small companies because that's more relevant now (i.e., for demographics), Q12
+num_size_companies = as.data.frame(table(data$company_size))
+num_size_companies$Percent = num_size_companies$Freq / sum(num_size_companies$Freq)
+num_size_companies
+print(xtable(num_size_companies), file="size_demog.tex")
+
+num_has_acc = subset(data, has_acc == TRUE)
+nrow(num_has_acc) # 221. quite a few 
+```
+
+# Reducing/renaming other mental health conditions gathered qualitatively (lightweight), stigma
+
+```{r}
+# Q17 is other mental health conditions
+# Manually annotated conditions people had.
+tb = as.data.frame(table(data$Q17))
+tb
+
+# Still made some typos, e.g., "Anxiety " is different from "Anxiety," so things show on different rows, but we can aggregate manually for these purposes. 
+
+
+library(tidyr)  # for unnesting lists
+library(dplyr)
+
+mh_conditions = data$Q17
+conditions_df <- data.frame(Mh = mh_conditions) %>%
+  mutate(Mh = strsplit(as.character(Mh), ", ")) %>%  # Split by comma and space
+  unnest(Mh)  # Convert list to long format
+
+mh_counts <- conditions_df %>%
+  count(Mh)  # Count occurrences of each word
+
+# print(mh_counts) # 286 did not have any other mental health conditions
+
+mh_counts = mh_counts[order(mh_counts$n), decreasing = TRUE]
+
+(493 - 286) / 493 # percentage of participants who have some diagnosed/suspected mental health condition (not neurodivergence)
+
+# how many NT people also had MH condition? 
+nt_with_mh = subset(data, mh_condition == TRUE & group == "NT")
+nrow(nt_with_mh) / 194
+
+# Are ND people in our sample more likely to have coexisting mental health conditions?
+tb = table(data$group, data$mh_condition)
+result = chisq.test(tb)
+result
+result$stdres
+# They do vary significantly: ADHD + AuDHD more likely to have mh condition, NT wayy less likely. So, even though just having ADHD doesn't affect mental health, ADHD participants are more likely to have mental health conditions, which negatively affect PMH
+
+```
+
+# Function to adjust p-values from models
+
+```{r}
+adjust_pvalues <- function(model) {
+  # Extract all p-values from the models
+  p_values_list <- lapply(models, function(model) summary(model)$coefficients[, "Pr(>|t|)"])
+  
+  # Flatten the list of p-values into a single vector
+  all_p_values <- unlist(p_values_list)
+  
+  # Adjust the p-values (using Benjamini-Hochberg, for example)
+  adjusted_p_values <- p.adjust(all_p_values, method = "fdr")
+  
+  # Split the adjusted p-values back into a list corresponding to the models
+  split_adjusted_p_values <- split(adjusted_p_values, rep(1:length(models), sapply(p_values_list, length)))
+  
+  # Initialize a list to store the adjusted summaries
+  adjusted_summaries <- list()
+  
+  # Replace the p-values in each model's coefficients table
+  for (i in seq_along(models)) {
+    # Extract the original summary
+    model_summary <- summary(models[[i]])
+    
+    # Adjust p-values in the coefficient table
+    model_summary$coefficients[, "Pr(>|t|)"] <- split_adjusted_p_values[[i]]
+    
+    # Store the adjusted summary in the list
+    adjusted_summaries[[i]] <- model_summary
+  }
+  
+  # Return the list of adjusted summaries
+  return(adjusted_summaries)
+}
+```
+
+# Mental health models
+
+```{r}
+# We are going to be using linear mixed-effects models (command: lmer) for this one. The PMH scale is meant to be aggregated as in an average and we plan to use categorical variables with many levels and variable effects (e.g., company size, location) as predictors.
+
+# Predictors: neurotype, location (can do country or region), company size, wfh status, job satisfaction, whether they have a coexisting condition
+# Although age may vary with wellbeing statistically when people get older, most of our population is under the age this may be relevant, so we do not need to add it
+full_model = lmer(pmh_avg ~ group + (1 | country) + company_size + wfh_status + job_satisfaction + has_acc + mh_condition, data = data)
+
+confint(full_model)
+
+# Conf. int for random effect includes zero, so we don't need to include it
+reduced_model = lm(pmh_avg ~ group + company_size + wfh_status + job_satisfaction + has_acc + mh_condition, data = data)
+
+confint(reduced_model)
+summary(reduced_model)
+
+# For our next models, we'd like to look at neurodivergent people specifically. Look at disclosure status and felt stigma as predictors
+# For ADHD: look at whether being diagnosed in adulthood or not is correlated with PMH
+only_nd = subset(data, group != "NT")
+only_adhd = subset(data, HasADHD == TRUE)
+
+nd_happiness_model = lm(pmh_avg ~ company_size + wfh_status + job_satisfaction + has_acc + mh_condition + disclosed + stigma, data = only_nd)
+confint(nd_happiness_model)
+summary(nd_happiness_model)
+# WFH has no effect on PMH among only ND people. Smaller companies have a larger impact on PMH of neurodivergent people -- we hypothesize due to low resources and higher responsibilities/stress of young or less-resourced companies.
+
+only_adhd$ageofadhd_realization = factor(only_adhd$ageofadhd_realization)
+
+adhd_happiness_model = lm(pmh_avg ~ company_size + wfh_status + job_satisfaction + has_acc + mh_condition + disclosed + stigma + ageofadhd_realization, data = only_adhd)
+confint(adhd_happiness_model)
+summary(adhd_happiness_model)
+# Realizing in childhood good for mental health, but most of our sample realized in adulthood (which is atypical). Software-specific reasons -- learn to mask, something becomes untenable later in life, seek out help.
+
+models = list(reduced_model, nd_happiness_model, adhd_happiness_model)
+summary_list = adjust_pvalues(models)
+
+print(xtable(summary_list[[1]]), file = "happiness_model.tex")
+print(xtable(summary_list[[2]]), file = "nd_happiness_model.tex")
+print(xtable(summary_list[[3]]), file = "adhd_happiness_model.tex")
+```
+
+# See effects of standup, pair programming on wellbeing
+
+```{r}
+# Q91_3 and 92_3 are standup and pair programming effects, respectively
+
+# Standup
+median(as.numeric(data$Q91_3), na.rm = T) # Somewhat helps
+median(as.numeric(only_nd$Q91_3), na.rm = T) # ditto
+
+csq = chisq.test(table(data$group, data$Q91_3))
+csq
+csq$stdres
+# AuDHD far more likely to say that standup hinders their wellbeing
+# NT more likely to say it helps somewhat
+
+# Pair programming
+median(as.numeric(data$Q92_3), na.rm = T) # Helps a lot!
+median(as.numeric(only_nd$Q92_3), na.rm = T) # ditto
+
+csq = chisq.test(table(data$group, data$Q92_3))
+csq # No differences between neurotypes
+
+```
+
+# ND Disclosure stats
+
+```{r}
+# No. NT to get proportions of things:
+nrow(subset(data, group == "NT"))
+num_allnd = 493 - 194 # No. non-NT
+
+# Go through disc.emp and make table
+which(names(data) == "disc.emp._3")
+
+disc_table = data.frame(response = character(),
+                               num = numeric(),
+                               percent = numeric())
+make_disc_table = function(df, i, dividend) {
+  num_said = sum(!is.na(data[i]))
+  new_row = data.frame(response = colnames(data)[i],
+             num = num_said,
+             percent = (num_said / dividend))
+  df = rbind(df, new_row)
+  return(df)
+}
+
+for (i in 193:196) {
+  disc_table = make_disc_table(disc_table, i, num_allnd)
+}
+
+# How many ND people disclose, and to whom, at work? 143 to coworker, 116 to supervisor
+disc_table
+print(xtable(disc_table), file = "nd_disclosure.tex", include.rownames = FALSE)
+# Can do X^2 to show whether someone with ADHD is more likely to disclose than someone with AuDHD, etc.
+
+table = table(only_nd$group, only_nd$disclosed)
+table = table[-1, ]
+result = chisq.test(table)
+result
+result$stdres
+
+# Indeed, p < .05. AuDHD'ers are more likely to disclose ND status. alpha = .05 standard residual +/- 1.96 is our threshold for significance. 
+# Therefore: +AuDHD, -Other ND
+
+# Reason to disclose to employer:
+which(names(data) == "reason.for.employer._7")
+disc_table = disc_table[0, ]
+for (i in 197:203) {
+  # Hard-code in num disclosed to employer
+  disc_table = make_disc_table(disc_table, i, 119)
+}
+disc_table
+# Mainly for transparency
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+print(xtable(disc_table), file = "reason_boss.tex", include.rownames = FALSE)
+
+# Reason to disclose to coworker
+which(names(data) == "cowork.reason._1")
+which(names(data) == "cowork.reason._7")
+disc_table = disc_table[0, ]
+for (i in 205:211) {
+  # Hard-code in num disclosed to coworker
+  disc_table = make_disc_table(disc_table, i, 147)
+}
+disc_table
+# Mainly for transparency, solidarity
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+print(xtable(disc_table), file = "reason_coworker.tex", include.rownames = FALSE)
+
+# Reasons not to disclose: no.disc
+which(names(data) == "no.disc._1")
+which(names(data) == "no.disc._6")
+disc_table = disc_table[0, ]
+tmp = subset(only_nd, disclosed == FALSE)
+num_did_not_disclose = nrow(tmp)
+for (i in 242:247) {
+  disc_table = make_disc_table(disc_table, i, num_did_not_disclose)
+}
+disc_table
+# Mostly because they don't see a benefit.
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+
+print(xtable(disc_table), file = "reasons_no_disclosure.tex", include.rownames = FALSE)
+```
+
+# ND Disclosure Outcomes
+
+```{r}
+# Broad outcome of disclosing to coworker: Q50
+coworker_disclosure = as.data.frame(table(only_nd$Q50))
+total = sum(coworker_disclosure$Freq)
+print(total)
+coworker_disclosure$percent = coworker_disclosure$Freq / total
+coworker_disclosure
+
+coworker_disclosure = coworker_disclosure[order(coworker_disclosure$percent, decreasing = TRUE), ]
+
+coworker_disclosure$percent = paste0(round(coworker_disclosure$percent * 100), "%")
+
+print(xtable(coworker_disclosure), file = "broad_outcome_coworker.tex", include.rownames = FALSE)
+
+# Broad outcome of disclosing to boss/supervisor: pos.or.neg.disc.exp
+boss_disclosure = as.data.frame(table(only_nd$pos.or.neg.disc.exp))
+total = sum(boss_disclosure$Freq)
+print(total)
+boss_disclosure$percent = boss_disclosure$Freq / total
+boss_disclosure
+
+boss_disclosure = boss_disclosure[order(boss_disclosure$percent, decreasing = TRUE), ]
+
+boss_disclosure$percent = paste0(round(boss_disclosure$percent * 100), "%")
+
+print(xtable(boss_disclosure), file = "broad_outcome_boss.tex", include.rownames = FALSE)
+
+# do Fisher's Exact test for neurotype vs. broad outcomes of disclosing because the expected frequency for all of the cells is 5 or less (borderline for Autistic --> 19 / 4 categories)
+table = table(only_nd$group, only_nd$Q50)
+table
+# NT row not relevant for this test, drop
+table = table[-1, ]
+fish = fisher.test(table)
+print(fish)
+# Take out Other ND
+table = table[-4, ]
+fish = fisher.test(table)
+print(fish)
+
+# Fisher's Exact test for boss outcomes
+table = table(only_nd$group, only_nd$pos.or.neg.disc.exp)
+table = table[-1, ]
+fish = fisher.test(table)
+print(fish)
+table = table[-4, ]
+fish = fisher.test(table)
+print(fish)
+# Verdict: no differences between neurotypes on pos/neg outcomes of disclosing to a coworker or boss
+
+# Specific positive outcomes of disclosing to boss/supervisor: pos.outcomes
+which(names(data) == "pos.outcomes._1")
+which(names(data) == "pos.outcomes._6")
+disc_table = disc_table[0, ]
+# Use number of people who disclosed to boss as dividend
+for (i in 215:220) {
+  disc_table = make_disc_table(disc_table, i, 116)
+}
+disc_table
+# The majority of ND people who disclosed to their bosses felt that they had positive interactions or a good conversation as a result with their bosses. 15% received accs, 28% worked with employer to get support. Recall that ND people mainly disclosed for transparency purposes.
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+
+print(xtable(disc_table), file = "boss_positive_outcomes.tex", include.rownames = FALSE)
+
+# Specific negative outcomes of disclosing to boss/supervisor: neg.outcomes
+which(names(data) == "neg.outcomes._1")
+which(names(data) == "neg.outcomes._6")
+disc_table = disc_table[0, ]
+for (i in 222:227) {
+  disc_table = make_disc_table(disc_table, i, 116)
+}
+disc_table
+# 13% experienced stigma/discrimination and job insecurity/loss
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+
+print(xtable(disc_table), file = "boss_negative_outcomes.tex", include.rownames = FALSE)
+
+# Specific positive outcomes of disclosing to coworker: Q51
+which(names(data) == "Q51_1")
+which(names(data) == "Q51_6")
+disc_table = disc_table[0, ]
+for (i in 229:234) {
+  disc_table = make_disc_table(disc_table, i, 143)
+}
+disc_table
+# The majority of ND people who disclosed to their coworkers felt that they had positive interactions or a good conversation as a result with that coworker. 
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+
+print(xtable(disc_table), file = "coworker_positive_outcomes.tex", include.rownames = FALSE)
+
+# Specific negative outcomes of disclosing to coworker: Q66
+which(names(data) == "Q66_1")
+which(names(data) == "Q66_5")
+disc_table = disc_table[0, ]
+for (i in 236:240) {
+  disc_table = make_disc_table(disc_table, i, 143)
+}
+disc_table
+# Very few negative outcomes from disclosing to coworkers. ERGs and increased awareness/solidarity may be helpful.
+
+disc_table = disc_table[order(disc_table$percent, decreasing = TRUE), ]
+
+disc_table$percent = paste0(round(disc_table$percent * 100), "%")
+
+
+print(xtable(disc_table), file = "coworker_negative_outcomes.tex", include.rownames = FALSE)
+```
+
+# Combining stigma, discrimination, and negative interactions for ND coworker disclosure
+
+```{r}
+# Need to find distinct actors who chose /only/ negative interaction and not stigma/discrimination, then add this to total in outcomes table in the paper
+# Q66_2 is stigma/discrimination from coworker
+which(names(data) == "Q66_1")
+which(names(data) == "Q66_5")
+disc_table = disc_table[0, ]
+for (i in 236:240) {
+  disc_table = make_disc_table(disc_table, i, 143)
+}
+disc_table
+
+distinct_sub = subset(data, !is.na(Q66_4) & is.na(Q66_2))
+nrow(distinct_sub)
+```
+
+# Job satisfaction + positive disclosure outcomes
+
+```{r}
+only_disclosed_boss = subset(only_nd, disc.emp._5 == "Yes, to a boss/supervisor")
+only_disclosed_boss$pos_outcome_boss = ifelse(only_disclosed_boss$pos.or.neg.disc.exp == "Positive", TRUE, FALSE)
+
+tb = table(only_disclosed_boss$job_satisfaction, only_disclosed_boss$pos_outcome_boss)
+csq = chisq.test(tb)
+csq
+csq$stdres
+
+only_disclosed_coworker = subset(only_nd, disc.emp._4 == "Yes, to a coworker")
+only_disclosed_coworker$pos_outcome_coworker = ifelse(only_disclosed_coworker$Q50 == "Positive", TRUE, FALSE)
+
+tb = table(only_disclosed_coworker$job_satisfaction, only_disclosed_coworker$pos_outcome_coworker)
+csq = chisq.test(tb)
+csq
+csq$stdres
+```
+
+# What predictors inform someone disclosing or not
+
+```{r}
+# for only_nd dataframe, glm() call for binary logistic regression
+# look for age/diagnostic status, wfh status as predictors
+# diagnosis status is only in adhd 
+# Age differences in attitudes on "bring your full self to work" and trusting people online
+
+levels(only_nd$region)
+only_nd$region = relevel(only_nd$region, ref = "North America")
+
+m = glm(disclosed ~ group + age + company_size + wfh_status + pmh_avg, data = only_nd)
+summary(m)
+confint(m)
+
+# Note: tried country as a random effect, it was ruled out since the confint of the standard deviation of the random effect included zero. Used region instead -- none statistically significant
+
+# Do CSQ of disclosure (has_disclosed) and group
+tb = table(only_nd$disclosed, only_nd$group)
+tb = tb[, -1]
+tb
+csq = chisq.test(tb)
+csq
+csq$stdres
+
+# Do CSQ of diagnostic status and disclosure
+tb = table(only_adhd$disclosed, only_adhd$diagnosis_status)
+tb
+csq = chisq.test(tb)
+csq
+csq$stdres
+
+# AuDHD people disclosed slightly more often, with an estimate of 0.142084 (matches our X^2)
+
+only_adhd$region = relevel(only_adhd$region, ref = "North America")
+
+# Look at age of realization and disclosure status 
+tb = table(only_adhd$ageofadhd_realization, only_adhd$disclosed)
+tb
+# Fine to do Chi squared, have sufficient numbers
+csq = chisq.test(tb)
+csq
+csq$stdres
+# No difference
+
+m2 = glm(disclosed ~ group + age + wfh_status + company_size + ageofadhd_realization + diagnosis_status, data = only_adhd)
+nrow(only_adhd)
+summary(m2)
+confint(m2)
+
+# Interesting...anyone who has ADHD (AuDHD, ADHD): age has a slightly positive effect on disclosure. (Is this because there's a correlation between age and diagnosis?) Whether or not someone was diagnosed was a medium/relatively strong effect, estimate of 0.324701 (being diagnosed means you are more likely to disclose -- mirroring survey qual data)
+
+# May want to do independent two-sample t-test for people who are diagnosed vs. their age before we report
+
+diagnosed_set = subset(only_adhd, diagnosis_status == TRUE)
+undiagnosed_set = subset(only_adhd, diagnosis_status == FALSE)
+
+t.test(diagnosed_set$age, undiagnosed_set$age) # interesting. no difference. maybe older folks have a better understanding of how to disclose and what they need
+
+# Adjust p-values and print to latex tables
+models = list(m, m2)
+summary_list = adjust_pvalues(models)
+
+print(xtable(summary_list[[1]]), file = "nd_disclosure_model.tex")
+print(xtable(summary_list[[2]]), file = "audhd_and_adhd_disclosure_model.tex")
+
+```
+
+# Num. NT participants disclosed to
+
+```{r}
+# Find how many NT participants were disclosed to by at least one sort of human (boss, employee, coworker)
+
+nt_disclosed_to = subset(data, !is.na(disclose.to.you._6) | !is.na(disclose.to.you._7)
+                         | !is.na(disclose.to.you._8) | !is.na(disclose.to.you._9))
+nrow(nt_disclosed_to)
+# 74, while 110 were not
+```
+
+# NT Recipients of Disclosure stats
+
+```{r}
+only_nt = subset(data, group == "NT")
+
+# Getting disclosed to: disclose.to.you._6 is first
+which(names(data) == "disclose.to.you._6")
+which(names(data) == "disclose.to.you._10")
+disc_table = disc_table[0, ]
+for (i in 171:175) {
+  disc_table = make_disc_table(disc_table, i, num_nt)
+}
+disc_table # Mostly no, 34% from a coworker
+
+# Broad outcome of getting disclosed to: disc.to.me.outcome
+disclosed_to = as.data.frame(table(only_nt$disc.to.me.outcome))
+num_disclosed_to = sum(disclosed_to$Freq)
+disclosed_to$Percentage = disclosed_to$Freq / num_disclosed_to
+disclosed_to
+
+# Specific positive outcomes of being disclosed to: pos.disc.to.me._1
+which(names(data) == "pos.disc.to.me._1")
+which(names(data) == "pos.disc.to.me._8")
+disc_table = disc_table[0, ]
+for (i in 177:184) {
+  disc_table = make_disc_table(disc_table, i, num_disclosed_to)
+}
+disc_table # Most people either thought they understood the discloser more or felt that the event went well/they had a good conversation
+
+# Specific negative outcomes of being disclosed to: neg.disc.to.me._1
+which(names(data) == "neg.disc.to.me._1")
+which(names(data) == "neg.disc.to.me._6")
+disc_table = disc_table[0, ]
+for (i in 186:191) {
+  disc_table = make_disc_table(disc_table, i, num_disclosed_to)
+}
+disc_table # We note that people may report incorrectly -- they don't want to look bad
+```
+
+# Stigma and neurotypes, preferred interviews and WFH status
+
+```{r}
+# median stigma for ND participants, X^2 to see if neurotype influences
+# Stigma is negatively correlated with PMH (see above)
+only_nd$stigma = as.numeric(as.character(only_nd$stigma))
+print("Levels of stigma var: ")
+range(only_nd$stigma, na.rm = T)
+print("Median stigma: ")
+median(only_nd$stigma, na.rm = T)
+# Never! nice.
+
+# Does neurotype affect perceived stigma?
+tb = table(only_nd$group, only_nd$stigma)
+csq = chisq.test(tb)
+csq # No
+# INFO: we are removing Other ND from this analysis because the numbers are too small for chi square, and the table is too computationally complex for fisher's exact to handle. The chi-square without this removal is above.
+tb = tb[-4, ]
+csq = chisq.test(tb)
+csq # No
+
+# Were ND participants more likely to want to work from home/want certain types of interviews than NT participants?
+# Best work environment: 
+env_tb = table(data$group, data$Q78)
+env_tb = env_tb[-4, ]
+env_chisq = chisq.test(env_tb)
+env_chisq
+
+workenv = as.data.frame(table(data$Q78))
+total = sum(workenv$Freq)
+workenv$Percentage = workenv$Freq / total
+print(workenv) # We can see most people prefer hybrid or remote
+
+print("Next")
+print(as.data.frame(table(data$wfh_status))) # Most people are hybrid or remote
+
+# Preferred interview type: no significant differences
+# Per interview type, see if participants of different neurotypes differ significantly in their usage using Chi-squared tests
+
+which(colnames(data) == "Q89_1")
+which(colnames(data) == "Q89_8")
+
+chisq_interviews = data.frame(character(0),
+                              numeric(0),
+                          numeric(0),
+                          numeric(0))
+colnames(chisq_interviews) = c("interview.type", "sum", "og.p.value", "adjusted.p.value")
+for (i in 96:100) {
+  likes_interview = ifelse(!is.na(data[i]), TRUE, FALSE)
+  table = table(data$group, likes_interview)
+  result = chisq.test(table)
+
+  print(colnames(data)[i])
+  print(result)
+  print(result$stdres)
+  
+  new.row = data.frame(interview.type = colnames(data)[i],
+                       sum = sum(!is.na(data[i])),
+                       og.p.value = result$p.value,
+                       adjusted.p.value = 0)
+  chisq_interviews = rbind(chisq_interviews, new.row)
+}
+og_indices = which(chisq_interviews$og.p.value < .05)
+print(og_indices)
+og_significant = chisq_interviews[og_indices, 1]
+print("Significant before correction:")
+print(og_significant)
+
+# Correcttt them
+chisq_interviews$adjusted.p.value = p.adjust(chisq_interviews$og.p.value, method = "BH")
+
+post_indices = which(chisq_interviews$adjusted.p.value < .05)
+post_significant = chisq_interviews[post_indices, 1]
+print(post_significant)
+
+chisq_interviews
+# Zilch. AuDHD prefer behavioral interviews (either in-person or virtually) statistically signficiantly less BEFORE correction.
+```
+
+# Perceptions of accommodations and need for disclosure
+
+```{r}
+# Do people know if it's possible to receive accs for neurodivergence in their workplace?
+table = as.data.frame(table(data$acc.possible))
+table$Percentage = table$Freq / 493
+table # Most people aren't sure, but the next largest group thinks it is possible
+
+# Did ND people have to disclose their status for accommodations?
+required_disclose = data.frame(doc = sum(!is.na(data$no.yes.disc.acc._1)),
+                               told = sum(!is.na(data$no.yes.disc.acc._2)),
+                               no = sum(!is.na(data$no.yes.disc.acc._3)))
+required_disclose # Most ND people did not have to disclose that they were ND to receive these accommodations, which is great.
+
+# Accommodation difficulty
+acc_difficulty = data.frame(table(data$acc.difficulty))
+acc_difficulty
+median(as.numeric(data$acc.difficulty), na.rm = T) # 3, "Somewhat easy"
+
+# Does perceived acc difficulty vary with neurotype?
+table = table(data$group, data$acc.difficulty)
+csq = chisq.test(table)
+csq
+# No
+
+# Origin of idea -- who came up with the idea for an acc? 
+which(names(data) == "origin.of.idea._1")
+which(names(data) == "origin.of.idea._7")
+disc_table = disc_table[0, ]
+num_has_acc = subset(data, has_acc == TRUE)
+num_has_acc = nrow(num_has_acc)
+for (i in 279:285) {
+  disc_table = make_disc_table(disc_table, i, num_has_acc)
+}
+disc_table # Mostly me, then boss. Extra labor figuring that out.
+
+# data$Q43 is coworkers' reactions to accs
+table(data$Q43)
+table(only_nd$Q43)
+median(data$Q43, na.rm = T) # 2, mostly neutral or positive
+median(only_nd$Q43, na.rm = T) # same for ND 
+csq = chisq.test(table(data$group, data$Q43))
+csq # No differences
+```
